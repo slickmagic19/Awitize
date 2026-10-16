@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+oauth.json
+browser.json
+
+# builds
+dist/
+dist-electron/
+release/
+.vite/
+
+# misc
+*.log
+.DS_Store
+Thumbs.db
