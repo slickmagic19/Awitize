@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws everything; this base theme just keeps the system
+         chrome (status bar, window background) dark from the first frame. -->
+    <style name="Theme.Awitize" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0B1020</item>
+        <item name="android:statusBarColor">#0B1020</item>
+        <item name="android:navigationBarColor">#0B1020</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <style name="Theme.Awitize.Capture" parent="Theme.Awitize">
+        <item name="android:windowBackground">#0B1020</item>
+    </style>
+</resources>

@@ -1,11 +1,14 @@
 """Awitize music-api — ytmusicapi (metadata) + yt-dlp (stream URLs)."""
+import os
 import re
 import socket
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from ytmusicapi import YTMusic
 import requests
 import yt_dlp
@@ -21,6 +24,15 @@ SEARCH_TTL = 10 * 60  # 10min, metadata barely changes
 _all_cache: dict[str, tuple[float, dict]] = {}
 EXPLORE_TTL = 30 * 60  # 30min, shelves change slowly
 _explore_cache: dict[str, tuple[float, dict]] = {}
+
+# Offline library — persisted under AWITIZE_DATA_DIR (the desktop shell points
+# this at Electron userData); falls back to ./offline when run standalone.
+OF_DIR = Path(os.environ.get("AWITIZE_DATA_DIR") or (Path(__file__).resolve().parent / "offline"))
+OF_DIR.mkdir(parents=True, exist_ok=True)
+_VID_ID = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
+_OFF_MIME = {".m4a": "audio/mp4", ".webm": "audio/webm", ".opus": "audio/ogg",
+             ".ogg": "audio/ogg", ".weba": "audio/webm", ".mp3": "audio/mpeg",
+             ".aac": "audio/aac", ".mp4": "audio/mp4"}
 
 
 def _thumb(o: dict) -> str | None:
@@ -60,6 +72,19 @@ def _norm(r: dict) -> dict:
 @app.get("/health")
 def health():
     return {"ok": True, "ytmusic": True}
+
+
+@app.get("/connectivity")
+def connectivity():
+    """Real reachability probe for the desktop shell: the renderer polls this
+    at startup, on OS online/offline events, and every ~10s while offline to
+    switch between the full UI and downloads-only mode. Never errors — the
+    shell distinguishes 'no internet' ({online: false}) from 'backend down'."""
+    try:
+        with socket.create_connection(("www.youtube.com", 443), timeout=2.5):
+            return {"online": True}
+    except Exception:
+        return {"online": False}
 
 
 @app.get("/search")
@@ -169,13 +194,48 @@ def _classify(msg: str) -> HTTPException:
         "message": f"Couldn't resolve a stream ({msg[:120]}). Retry or pick another track."})
 
 
-def _reachable(host: str, timeout: float = 3.0) -> bool:
+_host_status: dict[str, tuple[bool, float]] = {}
+_ip_status: dict[str, tuple[bool, float]] = {}
+_served_ips: set[str] = set()  # IPs already proven to serve bytes
+_HOST_TTL = 600  # a blocked ISP node stays blocked for a while — remember it
+
+
+def _reachable_ip(ip: str, timeout: float = 0.8) -> bool:
     try:
-        with socket.create_connection((socket.gethostbyname(host), 443),
-                                      timeout=timeout):
+        with socket.create_connection((ip, 443), timeout=timeout):
             return True
     except Exception:
         return False
+
+
+def _memo(m: dict, key: str, val: bool) -> None:
+    m[key] = (val, time.time())
+    if len(m) > 1024:  # bound the memo
+        for k in list(m)[:-512]:
+            m.pop(k, None)
+
+
+def _host_ok(host: str) -> bool:
+    """Memoized by host AND by resolved IP — media node names rotate per
+    request, but the ISP's dead cache IPs stay put, so we learn them once."""
+    now = time.time()
+    st = _host_status.get(host)
+    if st and now - st[1] < _HOST_TTL:
+        return st[0]
+    try:
+        ip = socket.gethostbyname(host)
+    except Exception:
+        _memo(_host_status, host, False)
+        return False
+    st = _ip_status.get(ip)
+    if st and now - st[1] < _HOST_TTL:
+        ok = st[0]
+        _memo(_host_status, host, ok)
+        return ok
+    ok = _reachable_ip(ip)
+    _memo(_ip_status, ip, ok)
+    _memo(_host_status, host, ok)
+    return ok
 
 
 def _fetch_ok(url: str) -> bool:
@@ -193,22 +253,36 @@ def _fetch_ok(url: str) -> bool:
 def _fix_host(url: str) -> str:
     """ISPs sometimes blackhole the media node they hand out (their local
     cache), while Google's global edges stay reachable. A googlevideo URL
-    authorizes every node in `mn=` — hop to one that actually answers."""
+    authorizes every node in `mn=` — hop to one that actually answers.
+    Candidates are probed in parallel and results memoized, so the dead
+    node costs us once, never again."""
     try:
         p = urllib.parse.urlparse(url)
         host = p.hostname or ""
-        if not host or _reachable(host):
+        if not host:
             return url
         nodes = [n for n in urllib.parse.parse_qs(p.query)
                  .get("mn", [""])[0].split(",") if n]
-        for n in nodes:
-            for pref in ("rr1---", "rr2---", "rr3---", "rr4---", "rr5---"):
-                cand = f"{pref}{n}.googlevideo.com"
-                if not _reachable(cand):
-                    continue
-                alt = url.replace(host, cand, 1)
-                if _fetch_ok(alt):
-                    return alt
+        cands = [host] + [f"rr{i}---{n}.googlevideo.com"
+                          for n in nodes for i in (1, 2, 3)]
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            live = list(ex.map(_host_ok, cands))
+        if live[0]:
+            return url
+        for cand, ok in zip(cands[1:], live[1:]):
+            if not ok:
+                continue
+            alt = url.replace(host, cand, 1)
+            try:
+                ip = socket.gethostbyname(cand)
+            except Exception:
+                ip = ""
+            if ip and ip in _served_ips:  # already proven to serve audio
+                return alt
+            if _fetch_ok(alt):
+                if ip:
+                    _served_ips.add(ip)
+                return alt
     except Exception:
         pass
     return url
@@ -250,13 +324,131 @@ def _resolve(video_id: str) -> dict:
 
 
 @app.get("/stream/{video_id}")
-def stream(video_id: str):
+def stream(video_id: str, fresh: int = 0):
+    """Resolve a playable audio URL. ?fresh=1 skips the URL cache so a caller
+    whose cached URL expired (403/410 mid-playback) gets a brand-new one."""
     now = time.time()
-    if video_id in _cache and now - _cache[video_id][0] < CACHE_TTL:
+    if not fresh and video_id in _cache and now - _cache[video_id][0] < CACHE_TTL:
         return _cache[video_id][1]
     payload = _resolve(video_id)
     _cache[video_id] = (now, payload)
     return payload
+
+
+# ---------------------------------------------------------------- offline
+
+def _off_file(video_id: str) -> Path | None:
+    for f in OF_DIR.glob(f"{video_id}.*"):
+        if f.is_file() and f.suffix.lower() in _OFF_MIME:
+            return f
+    return None
+
+
+def _download_audio(video_id: str) -> Path:
+    """Fetch the bestaudio file with the same strategy ladder as /stream:
+    android_music, then the user's Firefox session, then web_music, default."""
+    done = _off_file(video_id)
+    if done:
+        return done
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    last_err = "empty response from YouTube"
+    for s in _STRATEGIES:
+        opts = {
+            # keep the container yt-dlp hands us — Chromium plays m4a/webm/opus
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": str(OF_DIR / f"{video_id}.%(ext)s"),
+            "quiet": True,
+            "noplaylist": True,
+            "retries": 2,
+            "socket_timeout": 15,
+            "extractor_args": s["extractor_args"],
+        }
+        if "cookies" in s:
+            opts["cookiesfrombrowser"] = s["cookies"]
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            got = _off_file(video_id)
+            if got:
+                return got
+            last_err = f"{s['name']}: no file produced"
+        except Exception as e:
+            for junk in OF_DIR.glob(f"{video_id}.*"):
+                if junk.suffix in (".part", ".ytdl") or ".part" in junk.name:
+                    try:
+                        junk.unlink()
+                    except OSError:
+                        pass
+            last_err = f"{s['name']}: {str(e).splitlines()[0][:200]}"
+    raise _classify(last_err)
+
+
+@app.post("/offline/save/{video_id}")
+def offline_save(video_id: str):
+    if not _VID_ID.match(video_id):
+        raise HTTPException(400, {"code": "BAD_ID", "message": "Invalid video id."})
+    f = _download_audio(video_id)
+    return {"videoId": video_id, "saved": True, "bytes": f.stat().st_size}
+
+
+@app.get("/offline/list")
+def offline_list():
+    items = []
+    for f in OF_DIR.iterdir():
+        if f.is_file() and f.suffix.lower() in _OFF_MIME:
+            items.append({"videoId": f.stem, "bytes": f.stat().st_size})
+    return {"items": items}
+
+
+@app.get("/offline/{video_id}")
+def offline_get(video_id: str, request: Request):
+    f = _off_file(video_id)
+    if not f:
+        raise HTTPException(404, "Not saved offline.")
+    size = f.stat().st_size
+    mime = _OFF_MIME.get(f.suffix.lower(), "application/octet-stream")
+    range_h = request.headers.get("range") or ""
+    m = re.match(r"bytes=(\d*)-(\d*)", range_h)
+    if m and size:
+        start = int(m.group(1)) if m.group(1) else 0
+        end = int(m.group(2)) if m.group(2) else size - 1
+        end = min(end, size - 1)
+        if start > end:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+
+        def chunks():
+            with open(f, "rb") as fh:
+                fh.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    blk = fh.read(min(65536, left))
+                    if not blk:
+                        break
+                    left -= len(blk)
+                    yield blk
+
+        return StreamingResponse(chunks(), status_code=206, media_type=mime,
+                                 headers={"Content-Range": f"bytes {start}-{end}/{size}",
+                                          "Accept-Ranges": "bytes",
+                                          "Content-Length": str(end - start + 1)})
+    return FileResponse(f, media_type=mime, headers={"Accept-Ranges": "bytes"})
+
+
+@app.delete("/offline/{video_id}")
+def offline_delete(video_id: str):
+    removed, busy = 0, False
+    for f in OF_DIR.glob(f"{video_id}.*"):
+        if not f.is_file():
+            continue
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            busy = True
+    if removed == 0 and busy:
+        raise HTTPException(409, {"code": "FILE_BUSY",
+            "message": "That download is in use right now — stop playback (or wait a moment) and try again."})
+    return {"removed": removed > 0}
 
 
 LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
@@ -297,6 +489,29 @@ def _parse_lrc(s: str | None) -> list[dict]:
     return sorted(out, key=lambda x: x["t"])
 
 
+_TITLE_NOISE = re.compile(
+    r"\s*[\(\[]\s*(?:official|lyrics?|lyric\s+video|music\s+video|video|audio"
+    r"|visuali[sz]er|mv|hd|hq|4k|8k|explicit|clean)\b[^\)\]]*[\)\]]",
+    re.IGNORECASE)
+
+
+def _clean_title(title: str, artist: str) -> str:
+    """YouTube titles carry noise that breaks LRCLIB matching:
+    "Artist - Song (Official Music Video)" -> "Song". Without this, LRCLIB
+    finds the YT-rip plain-only entry (or nothing) instead of the synced
+    album lyrics, and the karaoke highlight never activates."""
+    t = title.strip()
+    if artist:
+        low, a = t.lower(), artist.strip().lower()
+        for sep in (" - ", " – ", " — ", " | ", ": "):
+            if low.startswith(a + sep):
+                t = t[len(a) + len(sep):]
+                break
+    t = _TITLE_NOISE.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" -–—|")
+    return t or title.strip()
+
+
 @app.get("/lyrics/full")
 def lyrics_full(videoId: str = "", title: str = "", artists: str = "",
                 album: str = "", duration: str = ""):
@@ -334,23 +549,34 @@ def lyrics_full(videoId: str = "", title: str = "", artists: str = "",
             scored.sort(key=lambda x: x[0])
             return scored[0][1] if scored else []
 
-        base = {"track_name": title.strip(), "artist_name": first_artist,
-                "album_name": album.strip(), "duration": duration.strip()}
-        base = {k: v for k, v in base.items() if v}
-        hit = _get("/get", base)
-        if hit and hit.get("syncedLyrics"):
-            lines = _parse_lrc(hit["syncedLyrics"])
+        def _lrclib(track: str):
+            base = {"track_name": track, "artist_name": first_artist,
+                    "album_name": album.strip(), "duration": duration.strip()}
+            base = {k: v for k, v in base.items() if v}
+            hit = _get("/get", base)
+            if hit and hit.get("syncedLyrics"):
+                lines = _parse_lrc(hit["syncedLyrics"])
+                if lines:
+                    return {"synced": True, "source": "lrclib", "lines": lines}
+            cands = _get("/search", {"q": f"{track} {first_artist}"})
+            lines = _best(cands)
             if lines:
                 return {"synced": True, "source": "lrclib", "lines": lines}
-        cands = _get("/search", {"q": f"{title.strip()} {first_artist}"})
-        lines = _best(cands)
-        if lines:
-            return {"synced": True, "source": "lrclib", "lines": lines}
-        plain = (hit or {}).get("plainLyrics") or next(
-            (c.get("plainLyrics") for c in (cands or []) if c.get("plainLyrics")), "")
-        if plain:
-            return {"synced": False, "source": "lrclib",
-                    "lines": [{"t": 0, "text": ln} for ln in plain.splitlines() if ln.strip()]}
+            plain = (hit or {}).get("plainLyrics") or next(
+                (c.get("plainLyrics") for c in (cands or []) if c.get("plainLyrics")), "")
+            if plain:
+                return {"synced": False, "source": "lrclib",
+                        "lines": [{"t": 0, "text": ln} for ln in plain.splitlines() if ln.strip()]}
+            return None
+
+        clean = _clean_title(title, first_artist)
+        out = _lrclib(clean)
+        if clean.lower() != title.strip().lower() and not (out or {}).get("synced"):
+            raw = _lrclib(title.strip())
+            if raw and (raw["synced"] or not out):
+                out = raw
+        if out:
+            return out
     # ytmusicapi plain-text fallback
     try:
         if videoId:

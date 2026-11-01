@@ -5,6 +5,8 @@
   "workspaces": ["apps/desktop"],
   "scripts": {
     "dev": "npm --workspace apps/desktop run dev",
-    "build": "npm --workspace apps/desktop run build"
+    "build": "npm --workspace apps/desktop run build",
+    "fetch:python": "node scripts/fetch-python.js",
+    "dist:portable": "npm --workspace apps/desktop run dist:portable"
   }
 }

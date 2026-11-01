@@ -1,0 +1,9 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+# signing material stays local — release builds read it from the developer machine
+app/keystore/
